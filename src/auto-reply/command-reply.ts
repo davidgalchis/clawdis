@@ -1,30 +1,21 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { claudeCodeSpec } from "../agents/claude-code.js";
 import type {
-  AgentEvent,
-  AssistantMessage,
-  Message,
-} from "@mariozechner/pi-ai";
-import { piSpec } from "../agents/pi.js";
-import type { AgentMeta, AgentToolResult } from "../agents/types.js";
-import type { ClawdisConfig } from "../config/config.js";
+  AgentMeta,
+  AgentToolResult,
+  PermissionMode,
+} from "../agents/types.js";
+import type { ClawdisConfig, ProgressConfig } from "../config/config.js";
 import { isVerbose, logVerbose } from "../globals.js";
-import { emitAgentEvent } from "../infra/agent-events.js";
 import { logError } from "../logger.js";
 import { getChildLogger } from "../logging.js";
 import { splitMediaFromOutput } from "../media/parse.js";
+import { runClaudeCode } from "../process/claude-code-runner.js";
 import { enqueueCommand } from "../process/command-queue.js";
-import { runPiRpc } from "../process/tau-rpc.js";
 import { resolveUserPath } from "../utils.js";
 import { applyTemplate, type TemplateContext } from "./templating.js";
-import {
-  formatToolAggregate,
-  shortenMeta,
-  shortenPath,
-  TOOL_RESULT_DEBOUNCE_MS,
-  TOOL_RESULT_FLUSH_COUNT,
-} from "./tool-meta.js";
+import { formatToolAggregate, shortenMeta } from "./tool-meta.js";
 import type { ReplyPayload } from "./types.js";
 
 function stripStructuralPrefixes(text: string): string {
@@ -33,117 +24,6 @@ function stripStructuralPrefixes(text: string): string {
     .replace(/^[ \t]*[A-Za-z0-9+()\-_. ]+:\s*/gm, "")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function stripRpcNoise(raw: string): string {
-  // Drop rpc streaming scaffolding (toolcall deltas, audio buffer events) before parsing.
-  const lines = raw.split(/\n+/);
-  const kept: string[] = [];
-  for (const line of lines) {
-    try {
-      const evt = JSON.parse(line);
-      const type = evt?.type;
-      const msg = evt?.message ?? evt?.assistantMessageEvent;
-      const msgType = msg?.type;
-      const role = msg?.role;
-
-      // Drop early lifecycle frames; we only want final assistant/tool outputs.
-      if (type === "message_start") continue;
-
-      // RPC streaming emits one message_update per delta; skip them to avoid flooding fallbacks.
-      if (type === "message_update") continue;
-
-      // Ignore toolcall delta chatter and input buffer append events.
-      if (msgType === "toolcall_delta") continue;
-      if (type === "input_audio_buffer.append") continue;
-
-      // Preserve agent_end so piSpec.parseOutput can extract the final message set.
-      if (type === "agent_end") {
-        kept.push(line);
-        continue;
-      }
-
-      // Keep only assistant/tool messages; drop agent_start/turn_start/user/etc.
-      const isAssistant = role === "assistant";
-      const isToolRole =
-        typeof role === "string" && role.toLowerCase().includes("tool");
-      if (!isAssistant && !isToolRole) continue;
-
-      // Ignore assistant messages that have no text content unless they carry usage (final message_end often does).
-      if (msg?.role === "assistant" && Array.isArray(msg?.content)) {
-        const hasText = msg.content.some(
-          (c: unknown) => (c as { type?: string })?.type === "text",
-        );
-        const hasUsage =
-          typeof msg?.usage === "object" &&
-          (msg.usage?.input != null || msg.usage?.output != null);
-        if (!hasText && !hasUsage) continue;
-      }
-    } catch {
-      // not JSON; keep as-is
-    }
-    if (line.trim()) kept.push(line);
-  }
-  return kept.join("\n");
-}
-
-function extractRpcAssistantText(raw: string): string | undefined {
-  if (!raw.trim()) return undefined;
-  let deltaBuffer = "";
-  let lastAssistant: string | undefined;
-  for (const line of raw.split(/\n+/)) {
-    try {
-      const evt = JSON.parse(line) as {
-        type?: string;
-        message?: {
-          role?: string;
-          content?: Array<{ type?: string; text?: string }>;
-        };
-        assistantMessageEvent?: {
-          type?: string;
-          delta?: string;
-          content?: string;
-        };
-      };
-      if (
-        evt.type === "message_end" &&
-        evt.message?.role === "assistant" &&
-        Array.isArray(evt.message.content)
-      ) {
-        const text = evt.message.content
-          .filter((c) => c?.type === "text" && typeof c.text === "string")
-          .map((c) => c.text as string)
-          .join("\n")
-          .trim();
-        if (text) {
-          lastAssistant = text;
-          deltaBuffer = "";
-        }
-      }
-      if (evt.type === "message_update" && evt.assistantMessageEvent) {
-        const evtType = evt.assistantMessageEvent.type;
-        if (
-          evtType === "text_delta" ||
-          evtType === "text_end" ||
-          evtType === "text_start"
-        ) {
-          const chunk =
-            typeof evt.assistantMessageEvent.delta === "string"
-              ? evt.assistantMessageEvent.delta
-              : typeof evt.assistantMessageEvent.content === "string"
-                ? evt.assistantMessageEvent.content
-                : "";
-          if (chunk) {
-            deltaBuffer += chunk;
-            lastAssistant = deltaBuffer;
-          }
-        }
-      }
-    } catch {
-      // ignore malformed/non-JSON lines
-    }
-  }
-  return lastAssistant?.trim() || undefined;
 }
 
 function extractNonJsonText(raw: string): string | undefined {
@@ -183,17 +63,30 @@ type CommandReplyParams = {
   thinkLevel?: ThinkLevel;
   verboseLevel?: "off" | "on";
   onPartialReply?: (payload: ReplyPayload) => Promise<void> | void;
+  /** Called when Claude reports its actual session ID (may differ from input for forked sessions) */
+  onSessionReady?: (info: { sessionId: string; cwd?: string }) => void;
   runId?: string;
   onAgentEvent?: (evt: {
     stream: string;
     data: Record<string, unknown>;
   }) => void;
+  permissionMode?: PermissionMode;
+  /** Auto-continue when output looks incomplete */
+  autoContinue?: boolean;
+  /** Max auto-continue attempts (default: 3) */
+  autoContinueMax?: number;
+  /** Tracking ID for cancellation (e.g., chat ID) */
+  trackingId?: string;
+  /** Progress visibility settings */
+  progressConfig?: ProgressConfig;
 };
 
 export type CommandReplyMeta = {
   durationMs: number;
   queuedMs?: number;
   queuedAhead?: number;
+  /** Output looks incomplete (ends with colon, "let me try", etc.) */
+  looksIncomplete?: boolean;
   exitCode?: number | null;
   signal?: string | null;
   killed?: boolean;
@@ -204,135 +97,6 @@ export type CommandReplyResult = {
   payloads?: ReplyPayload[];
   meta: CommandReplyMeta;
 };
-
-type ToolMessageLike = {
-  name?: string;
-  toolName?: string;
-  tool_call_id?: string;
-  toolCallId?: string;
-  role?: string;
-  details?: Record<string, unknown>;
-  arguments?: Record<string, unknown>;
-  content?: unknown;
-};
-
-function inferToolName(message?: ToolMessageLike): string | undefined {
-  if (!message) return undefined;
-  const candidates = [
-    message.toolName,
-    message.name,
-    message.toolCallId,
-    message.tool_call_id,
-  ]
-    .map((c) => (typeof c === "string" ? c.trim() : ""))
-    .filter(Boolean);
-  if (candidates.length) return candidates[0];
-
-  if (message.role?.includes(":")) {
-    const suffix = message.role.split(":").slice(1).join(":").trim();
-    if (suffix) return suffix;
-  }
-  return undefined;
-}
-
-function inferToolMeta(message?: ToolMessageLike): string | undefined {
-  if (!message) return undefined;
-  // Special handling for edit tool: surface change kind + path + summary.
-  if (
-    (message.toolName ?? message.name)?.toLowerCase?.() === "edit" ||
-    message.role === "tool_result:edit"
-  ) {
-    const details = message.details ?? message.arguments;
-    const diff =
-      details && typeof details.diff === "string" ? details.diff : undefined;
-
-    // Count added/removed lines to infer change kind.
-    let added = 0;
-    let removed = 0;
-    if (diff) {
-      for (const line of diff.split("\n")) {
-        const trimmed = line.trimStart();
-        if (trimmed.startsWith("+++")) continue;
-        if (trimmed.startsWith("---")) continue;
-        if (trimmed.startsWith("+")) added += 1;
-        else if (trimmed.startsWith("-")) removed += 1;
-      }
-    }
-    let changeKind = "edit";
-    if (added > 0 && removed > 0) changeKind = "insert+replace";
-    else if (added > 0) changeKind = "insert";
-    else if (removed > 0) changeKind = "delete";
-
-    // Try to extract a file path from content text or details.path.
-    const contentText = (() => {
-      const raw = (message as { content?: unknown })?.content;
-      if (!Array.isArray(raw)) return undefined;
-      const texts = raw
-        .map((c) =>
-          typeof c === "string"
-            ? c
-            : typeof (c as { text?: unknown }).text === "string"
-              ? ((c as { text?: string }).text ?? "")
-              : "",
-        )
-        .filter(Boolean);
-      return texts.join(" ");
-    })();
-
-    const pathFromDetails =
-      details && typeof details.path === "string" ? details.path : undefined;
-    const pathFromContent =
-      contentText?.match(/\s(?:in|at)\s+(\S+)/)?.[1] ?? undefined;
-    const pathVal = pathFromDetails ?? pathFromContent;
-    const shortPath = pathVal ? shortenMeta(pathVal) : undefined;
-
-    // Pick a short summary from the first added line in the diff.
-    const summary = (() => {
-      if (!diff) return undefined;
-      const addedLine = diff
-        .split("\n")
-        .map((l) => l.trimStart())
-        .find((l) => l.startsWith("+") && !l.startsWith("+++"));
-      if (!addedLine) return undefined;
-      const cleaned = addedLine.replace(/^\+\s*\d*\s*/, "").trim();
-      if (!cleaned) return undefined;
-      const markdownStripped = cleaned.replace(/^[#>*-]\s*/, "");
-      if (cleaned.startsWith("#")) {
-        return `Add ${markdownStripped}`;
-      }
-      return markdownStripped;
-    })();
-
-    const parts: string[] = [`→ ${changeKind}`];
-    if (shortPath) parts.push(`@ ${shortPath}`);
-    if (summary) parts.push(`| ${summary}`);
-    return parts.join(" ");
-  }
-
-  const details = message.details ?? message.arguments;
-  const pathVal =
-    details && typeof details.path === "string" ? details.path : undefined;
-  const offset =
-    details && typeof details.offset === "number" ? details.offset : undefined;
-  const limit =
-    details && typeof details.limit === "number" ? details.limit : undefined;
-  const command =
-    details && typeof details.command === "string"
-      ? details.command
-      : undefined;
-
-  const formatPath = shortenPath;
-
-  if (pathVal) {
-    const displayPath = formatPath(pathVal);
-    if (offset !== undefined && limit !== undefined) {
-      return `${displayPath}:${offset}-${offset + limit}`;
-    }
-    return displayPath;
-  }
-  if (command) return command;
-  return undefined;
-}
 
 function normalizeToolResults(
   toolResults?: Array<string | AgentToolResult>,
@@ -389,9 +153,9 @@ export async function runCommandReply(
   if (!reply.command?.length) {
     throw new Error("reply.command is required for mode=command");
   }
-  const agentCfg = reply.agent ?? { kind: "pi" };
-  const agent = piSpec;
-  const agentKind = "pi";
+  const agentCfg = reply.agent ?? { kind: "claude-code" };
+  const agent = claudeCodeSpec;
+  const agentKind = "claude-code";
   const rawCommand = reply.command;
   const hasBodyTemplate = rawCommand.some((part) =>
     /\{\{Body(Stripped)?\}\}/.test(part),
@@ -431,39 +195,26 @@ export async function runCommandReply(
   let insertSessionBeforeBody = true;
 
   // Session args prepared (templated) and injected generically
+  // Claude Code uses --session-id to specify which session to use/create
   if (reply.session) {
-    const defaultSessionDir = path.join(os.homedir(), ".clawdis", "sessions");
-    const sessionPath = path.join(defaultSessionDir, "{{SessionId}}.jsonl");
+    // For Claude Code session handling:
+    // - New sessions: use --session-id to create with our UUID
+    // - Resume: use --resume <sessionId> --fork-session to load specific session and fork
+    //   (--resume loads the exact session for context, --fork-session creates new ID to avoid locks)
     const defaultSessionArgs = {
-      newArgs: ["--session", sessionPath],
-      resumeArgs: ["--session", sessionPath],
+      newArgs: ["--session-id", "{{SessionId}}"],
+      resumeArgs: ["--resume", "{{SessionId}}", "--fork-session"],
     };
     const defaultNew = defaultSessionArgs.newArgs;
     const defaultResume = defaultSessionArgs.resumeArgs;
+    // Use newArgs if this is a new session OR if we've never sent to Claude yet
+    // (isFirstTurnInSession means systemSent is false, so Claude doesn't know this session ID)
+    const useNewSessionArgs = isNewSession || isFirstTurnInSession;
     sessionArgList = (
-      isNewSession
+      useNewSessionArgs
         ? (reply.session.sessionArgNew ?? defaultNew)
         : (reply.session.sessionArgResume ?? defaultResume)
     ).map((p) => applyTemplate(p, templatingCtx));
-
-    // If we are writing session files, ensure the directory exists.
-    const sessionFlagIndex = sessionArgList.indexOf("--session");
-    const sessionPathArg =
-      sessionFlagIndex >= 0 ? sessionArgList[sessionFlagIndex + 1] : undefined;
-    if (sessionPathArg && !sessionPathArg.includes("://")) {
-      const dir = path.dirname(sessionPathArg);
-      try {
-        await fs.mkdir(dir, { recursive: true });
-      } catch {
-        // best-effort
-      }
-    }
-
-    // Tau (pi agent) needs --continue to reload prior messages when resuming.
-    // Without it, pi starts from a blank state even though we pass the session file path.
-    if (!isNewSession && !sessionArgList.includes("--continue")) {
-      sessionArgList.push("--continue");
-    }
 
     insertSessionBeforeBody = reply.session.sessionArgBeforeBody ?? true;
   }
@@ -502,6 +253,8 @@ export async function runCommandReply(
     systemSent,
     identityPrefix: agentCfg.identityPrefix,
     format: agentCfg.format,
+    permissionMode: params.permissionMode,
+    cwd: resolvedCwd,
   });
 
   const promptIndex = builtArgv.findIndex(
@@ -517,20 +270,11 @@ export async function runCommandReply(
     return typeof arg === "string" ? arg.replace(bodyMarker, "") : arg;
   });
 
-  // Drive pi via RPC stdin so auto-compaction and streaming run server-side.
-  let rpcArgv = finalArgv;
-  const bodyIdx =
-    promptIndex >= 0 ? promptIndex : Math.max(finalArgv.length - 1, 0);
-  rpcArgv = finalArgv.filter((_, idx) => idx !== bodyIdx);
-  const modeIdx = rpcArgv.indexOf("--mode");
-  if (modeIdx >= 0 && rpcArgv[modeIdx + 1]) {
-    rpcArgv[modeIdx + 1] = "rpc";
-  } else {
-    rpcArgv.push("--mode", "rpc");
-  }
+  // For Claude Code, we run the command directly (no RPC mode like Pi).
+  // The finalArgv already has all the necessary flags from buildArgs.
 
   logVerbose(
-    `Running command auto-reply: ${rpcArgv.join(" ")}${resolvedCwd ? ` (cwd: ${resolvedCwd})` : ""}`,
+    `Running command auto-reply: ${finalArgv.join(" ")}${resolvedCwd ? ` (cwd: ${resolvedCwd})` : ""}`,
   );
   logger.info(
     {
@@ -538,7 +282,7 @@ export async function runCommandReply(
       sessionId: templatingCtx.SessionId,
       newSession: isNewSession,
       cwd: resolvedCwd,
-      command: rpcArgv.slice(0, -1), // omit body to reduce noise
+      command: finalArgv.slice(0, -1), // omit body to reduce noise
     },
     "command auto-reply start",
   );
@@ -551,7 +295,6 @@ export async function runCommandReply(
     let pendingMetas: string[] = [];
     let pendingTimer: NodeJS.Timeout | null = null;
     let streamedAny = false;
-    const toolMetaById = new Map<string, string | undefined>();
     const flushPendingTool = () => {
       if (!onPartialReply) return;
       if (!pendingToolName && pendingMetas.length === 0) return;
@@ -570,212 +313,241 @@ export async function runCommandReply(
         pendingTimer = null;
       }
     };
-    let lastStreamedAssistant: string | undefined;
-    const streamAssistantFinal = (msg?: AssistantMessage) => {
-      if (!onPartialReply || msg?.role !== "assistant") return;
-      const textBlocks = Array.isArray(msg.content)
-        ? (msg.content as Array<{ type?: string; text?: string }>)
-            .filter((c) => c?.type === "text" && typeof c.text === "string")
-            .map((c) => (c.text ?? "").trim())
-            .filter(Boolean)
-        : [];
-      if (textBlocks.length === 0) return;
-      const combined = textBlocks.join("\n").trim();
-      if (!combined || combined === lastStreamedAssistant) return;
-      lastStreamedAssistant = combined;
-      const { text: cleanedText, mediaUrls: mediaFound } =
-        splitMediaFromOutput(combined);
-      void onPartialReply({
-        text: cleanedText,
-        mediaUrls: mediaFound?.length ? mediaFound : undefined,
-      } as ReplyPayload);
-      streamedAny = true;
-    };
+
+    // Track tools executed for summary footer
+    const toolsExecuted: Array<{ name: string; detail: string }> = [];
 
     const run = async () => {
-      const runId = params.runId ?? crypto.randomUUID();
-      let body = promptArg ?? "";
-      if (!body || !body.trim()) {
-        body = templatingCtx.Body ?? templatingCtx.BodyStripped ?? "";
-      }
-
-      const rpcPromptIndex =
-        promptIndex >= 0 ? promptIndex : finalArgv.length - 1;
       logVerbose(
-        `pi rpc prompt (${body.length} chars): ${body.slice(0, 200).replace(/\n/g, "\\n")}`,
+        `claude-code prompt (${promptArg?.length ?? 0} chars): ${(promptArg ?? "").slice(0, 200).replace(/\n/g, "\\n")}`,
       );
-      // Build rpc args without the prompt body; force --mode rpc.
-      const rpcArgvForRun = (() => {
-        const copy = [...finalArgv];
-        copy.splice(rpcPromptIndex, 1);
-        const modeIdx = copy.indexOf("--mode");
-        if (modeIdx >= 0 && copy[modeIdx + 1]) {
-          copy.splice(modeIdx, 2, "--mode", "rpc");
-        } else if (!copy.includes("--mode")) {
-          copy.splice(copy.length - 1, 0, "--mode", "rpc");
-        }
-        return copy;
-      })();
-      type RpcStreamEvent =
-        | AgentEvent
-        // Tau sometimes emits a bare "message" frame; treat it like message_end for parsing.
-        | { type: "message"; message: Message }
-        | { type: "message_end"; message: Message };
 
-      const rpcResult = await runPiRpc({
-        argv: rpcArgvForRun,
+      // Run Claude Code directly (no RPC mode).
+      const result = await runClaudeCode({
+        argv: finalArgv,
         cwd: resolvedCwd,
-        prompt: body,
         timeoutMs,
-        onEvent: (line: string) => {
-          let ev: RpcStreamEvent;
+        trackingId: params.trackingId,
+        onLine: (line: string) => {
+          // Try to parse streaming JSON events
           try {
-            ev = JSON.parse(line) as RpcStreamEvent;
-          } catch {
-            return;
-          }
-
-          // Forward tool lifecycle events to the agent bus.
-          if (ev.type === "tool_execution_start") {
-            emitAgentEvent({
-              runId,
-              stream: "tool",
-              data: {
-                phase: "start",
-                name: ev.toolName,
-                toolCallId: ev.toolCallId,
-                args: ev.args,
-              },
-            });
-            params.onAgentEvent?.({
-              stream: "tool",
-              data: {
-                phase: "start",
-                name: ev.toolName,
-                toolCallId: ev.toolCallId,
-              },
-            });
-          }
-
-          if (
-            "message" in ev &&
-            ev.message &&
-            (ev.type === "message" || ev.type === "message_end")
-          ) {
-            const msg = ev.message as Message & {
-              toolCallId?: string;
-              tool_call_id?: string;
+            const ev = JSON.parse(line) as {
+              type?: string;
+              subtype?: string;
+              session_id?: string;
+              tool?: string;
+              tool_input?: Record<string, unknown>;
+              message?: {
+                role?: string;
+                content?: Array<{
+                  type?: string;
+                  text?: string;
+                  name?: string;
+                  input?: Record<string, unknown>;
+                  content?: string | Array<{ type?: string; text?: string }>;
+                }>;
+              };
             };
-            const role = (msg.role ?? "") as string;
-            const isToolResult =
-              role === "toolResult" || role === "tool_result";
-            if (isToolResult && Array.isArray(msg.content)) {
-              const toolName = inferToolName(msg);
-              const toolCallId = msg.toolCallId ?? msg.tool_call_id;
-              const meta =
-                inferToolMeta(msg) ??
-                (toolCallId ? toolMetaById.get(toolCallId) : undefined);
 
-              emitAgentEvent({
-                runId,
-                stream: "tool",
-                data: {
-                  phase: "result",
-                  name: toolName,
-                  toolCallId,
-                  meta,
-                },
+            // Capture actual session ID from init event (may differ for forked sessions)
+            if (
+              ev.type === "system" &&
+              ev.subtype === "init" &&
+              ev.session_id
+            ) {
+              params.onSessionReady?.({
+                sessionId: ev.session_id,
+                cwd: resolvedCwd,
               });
-              params.onAgentEvent?.({
-                stream: "tool",
-                data: {
-                  phase: "result",
-                  name: toolName,
-                  toolCallId,
-                  meta,
-                },
-              });
+            }
 
-              if (pendingToolName && toolName && toolName !== pendingToolName) {
-                flushPendingTool();
+            // Capture tool results (especially Task output)
+            if (ev.type === "user" && ev.message?.role === "user") {
+              const content = ev.message.content ?? [];
+              for (const c of content) {
+                if (c.type === "tool_result" && c.content && onPartialReply) {
+                  // Extract text from tool result
+                  const resultText =
+                    typeof c.content === "string"
+                      ? c.content
+                      : Array.isArray(c.content)
+                        ? c.content
+                            .filter(
+                              (x: { type?: string; text?: string }) =>
+                                x.type === "text",
+                            )
+                            .map((x: { text?: string }) => x.text)
+                            .join("\n")
+                        : "";
+                  if (resultText && resultText.length > 0) {
+                    // Show truncated result (Task outputs can be long)
+                    const preview =
+                      resultText.length > 500
+                        ? resultText.slice(0, 497) + "..."
+                        : resultText;
+                    void onPartialReply({
+                      text: `📤 Result:\n${preview}`,
+                    });
+                  }
+                }
               }
-              if (!pendingToolName) pendingToolName = toolName;
-              if (meta) pendingMetas.push(meta);
+            }
+
+            // Forward agent events
+            if (ev.type === "assistant" && ev.message?.role === "assistant") {
+              const content = ev.message.content ?? [];
+
+              // Progress config with defaults
+              const showTaskDescriptions =
+                params.progressConfig?.taskDescriptions ?? true;
+              const showThinking =
+                params.progressConfig?.thinkingPreviews ?? false;
+              const thinkingMaxChars =
+                params.progressConfig?.thinkingMaxChars ?? 100;
+
+              // Check for thinking blocks and tool use
+              for (const c of content) {
+                // Handle thinking blocks
+                if (
+                  c.type === "thinking" &&
+                  (c as { thinking?: string }).thinking &&
+                  showThinking &&
+                  onPartialReply
+                ) {
+                  const thinkingText = String(
+                    (c as { thinking?: string }).thinking,
+                  );
+                  const preview =
+                    thinkingText.length > thinkingMaxChars
+                      ? thinkingText.slice(0, thinkingMaxChars - 3) + "..."
+                      : thinkingText;
+                  // Clean up for display (single line)
+                  const cleanPreview = preview.replace(/\n+/g, " ").trim();
+                  void onPartialReply({
+                    text: `🧠 ${cleanPreview}`,
+                  });
+                }
+
+                if (c.type === "tool_use" && c.name) {
+                  const toolName = c.name;
+                  const input = c.input ?? {};
+                  let detail = "";
+
+                  // Extract useful details based on tool type
+                  if (toolName === "Read" && input.file_path) {
+                    detail = String(input.file_path);
+                  } else if (toolName === "Edit" && input.file_path) {
+                    detail = String(input.file_path);
+                  } else if (toolName === "Write" && input.file_path) {
+                    detail = String(input.file_path);
+                  } else if (toolName === "Bash" && input.command) {
+                    const cmd = String(input.command).slice(0, 40);
+                    detail = `\`${cmd}${String(input.command).length > 40 ? "..." : ""}\``;
+                  } else if (toolName === "Glob" && input.pattern) {
+                    detail = String(input.pattern);
+                  } else if (toolName === "Grep" && input.pattern) {
+                    detail = String(input.pattern);
+                  } else if (toolName === "Task") {
+                    detail = input.description ? String(input.description) : "";
+                  }
+
+                  // Track for footer
+                  toolsExecuted.push({ name: toolName, detail });
+
+                  // Send partial reply if callback provided
+                  if (onPartialReply) {
+                    // Use special format for Task tool to highlight what's being worked on
+                    if (toolName === "Task" && showTaskDescriptions && detail) {
+                      void onPartialReply({
+                        text: `📋 Task: ${detail}`,
+                      });
+                    } else {
+                      void onPartialReply({
+                        text: `🔧 ${toolName}${detail ? ` ${detail}` : ""}`,
+                      });
+                    }
+                  }
+                }
+              }
+
+              // Forward text content
+              const text = content
+                .filter((c) => c.type === "text" && c.text)
+                .map((c) => c.text)
+                .join("\n")
+                .trim();
+              if (text) {
+                params.onAgentEvent?.({
+                  stream: "assistant",
+                  data: { text },
+                });
+              }
+            }
+
+            // Handle streaming text deltas (content_block_delta events)
+            const showStreaming = params.progressConfig?.streamingText ?? false;
+            const streamingMaxChars =
+              params.progressConfig?.streamingMaxChars ?? 200;
+            if (showStreaming && onPartialReply) {
+              // Check for content_block_delta with text_delta
+              const evAny = ev as {
+                type?: string;
+                delta?: { type?: string; text?: string };
+                index?: number;
+              };
               if (
-                TOOL_RESULT_FLUSH_COUNT > 0 &&
-                pendingMetas.length >= TOOL_RESULT_FLUSH_COUNT
+                evAny.type === "content_block_delta" &&
+                evAny.delta?.type === "text_delta" &&
+                evAny.delta?.text
               ) {
-                flushPendingTool();
-                return;
+                const deltaText = evAny.delta.text;
+                // Only show if it's substantial (not just whitespace)
+                const trimmed = deltaText.trim();
+                if (trimmed.length > 5) {
+                  const preview =
+                    trimmed.length > streamingMaxChars
+                      ? trimmed.slice(0, streamingMaxChars - 3) + "..."
+                      : trimmed;
+                  void onPartialReply({
+                    text: `💬 ${preview}`,
+                  });
+                }
               }
-              if (pendingTimer) clearTimeout(pendingTimer);
-              pendingTimer = setTimeout(
-                flushPendingTool,
-                TOOL_RESULT_DEBOUNCE_MS,
-              );
-              return;
             }
-
-            if (msg.role === "assistant") {
-              streamAssistantFinal(msg as AssistantMessage);
-            }
-          }
-
-          if (
-            ev.type === "message_end" &&
-            "message" in ev &&
-            ev.message &&
-            ev.message.role === "assistant"
-          ) {
-            streamAssistantFinal(ev.message as AssistantMessage);
-            const text = extractRpcAssistantText(line);
-            if (text) {
-              params.onAgentEvent?.({
-                stream: "assistant",
-                data: { text },
-              });
-            }
-          }
-
-          // Preserve existing partial reply hook when provided.
-          if (
-            onPartialReply &&
-            "message" in ev &&
-            ev.message?.role === "assistant"
-          ) {
-            // Let the existing logic reuse the already-parsed message.
-            try {
-              streamAssistantFinal(ev.message as AssistantMessage);
-            } catch {
-              /* ignore */
-            }
+          } catch {
+            // Not JSON, ignore
           }
         },
       });
+
       flushPendingTool();
-      return rpcResult;
+      return result;
     };
 
-    const { stdout, stderr, code, signal, killed } = await enqueue(run, {
-      onWait: (waitMs, ahead) => {
-        queuedMs = waitMs;
-        queuedAhead = ahead;
-        if (isVerbose()) {
-          logVerbose(
-            `Command auto-reply queued for ${waitMs}ms (${queuedAhead} ahead)`,
-          );
-        }
+    const { stdout, stderr, code, signal, killed, timedOut } = await enqueue(
+      run,
+      {
+        onWait: (waitMs, ahead) => {
+          queuedMs = waitMs;
+          queuedAhead = ahead;
+          if (isVerbose()) {
+            logVerbose(
+              `Command auto-reply queued for ${waitMs}ms (${queuedAhead} ahead)`,
+            );
+          }
+        },
       },
-    });
+    );
     const stdoutUsed = stdout;
     const stderrUsed = stderr;
     const codeUsed = code;
     const signalUsed = signal;
     const killedUsed = killed;
-    const rpcAssistantText = extractRpcAssistantText(stdoutUsed);
+    const timedOutUsed = timedOut;
     const rawStdout = stdoutUsed.trim();
     let mediaFromCommand: string[] | undefined;
-    const trimmed = stripRpcNoise(rawStdout);
+    // For Claude Code, pass the raw output to parseOutput (it handles JSON parsing)
+    const trimmed = rawStdout;
     if (stderrUsed?.trim()) {
       logVerbose(`Command auto-reply stderr: ${stderrUsed.trim()}`);
     }
@@ -873,10 +645,8 @@ export async function runCommandReply(
       });
     }
 
-    // If parser gave nothing, fall back to best-effort assistant text (from RPC deltas),
-    // or any non-JSON stdout the child may have emitted (e.g. MEDIA tokens).
-    // Never fall back to raw stdout JSON protocol frames.
-    const fallbackText = rpcAssistantText ?? extractNonJsonText(rawStdout);
+    // If parser gave nothing, fall back to any non-JSON stdout the child may have emitted.
+    const fallbackText = extractNonJsonText(rawStdout);
     const normalize = (s?: string) =>
       stripStructuralPrefixes((s ?? "").trim()).toLowerCase();
     const bodyNorm = normalize(
@@ -911,6 +681,36 @@ export async function runCommandReply(
       logFailure();
     }
 
+    // Detect incomplete output for footer and auto-continue
+    const lastText = replyItems[replyItems.length - 1]?.text ?? "";
+    const trimmedLast = lastText.trim();
+    const textLooksIncomplete =
+      replyItems.length > 0 &&
+      (/[:]\s*$/.test(trimmedLast) ||
+        /\b(now|next|try|check|run|test|let me|going to)\s*[:.!]?\s*$/i.test(
+          trimmedLast,
+        ));
+    // Also mark as incomplete if process was killed (timeout) or produced no output while tools ran
+    const processWasKilled = killedUsed === true || timedOutUsed === true;
+    const noOutputButToolsRan =
+      replyItems.length === 0 && toolsExecuted.length > 0;
+    const outputLooksIncomplete =
+      textLooksIncomplete || processWasKilled || noOutputButToolsRan;
+
+    // Add footer when output looks incomplete and tools were executed
+    if (outputLooksIncomplete && toolsExecuted.length > 0) {
+      // Aggregate tools by name for concise summary
+      const toolCounts = new Map<string, number>();
+      for (const t of toolsExecuted) {
+        toolCounts.set(t.name, (toolCounts.get(t.name) ?? 0) + 1);
+      }
+      const toolSummary = [...toolCounts.entries()]
+        .map(([name, count]) => (count > 1 ? `${name}×${count}` : name))
+        .join(", ");
+      const footer = `\n\n📋 _Tools executed: ${toolSummary}_`;
+      replyItems[replyItems.length - 1].text = trimmedLast + footer;
+    }
+
     verboseLog(
       `Command auto-reply stdout produced ${replyItems.length} message(s)`,
     );
@@ -926,7 +726,7 @@ export async function runCommandReply(
         `Command auto-reply exited with code ${codeUsed ?? "unknown"} (signal: ${signalUsed ?? "none"})`,
       );
       // Include any partial output or stderr in error message
-      const summarySource = rpcAssistantText ?? trimmed;
+      const summarySource = trimmed;
       const partialOut = summarySource
         ? `\n\nOutput: ${summarySource.slice(0, 500)}${summarySource.length > 500 ? "..." : ""}`
         : "";
@@ -966,6 +766,7 @@ export async function runCommandReply(
       durationMs: Date.now() - started,
       queuedMs,
       queuedAhead,
+      looksIncomplete: outputLooksIncomplete,
       exitCode: codeUsed,
       signal: signalUsed,
       killed: killedUsed,
@@ -1040,9 +841,7 @@ export async function runCommandReply(
       const baseMsg =
         "Command timed out after " +
         `${timeoutSeconds}s${resolvedCwd ? ` (cwd: ${resolvedCwd})` : ""}. Try a shorter prompt or split the request.`;
-      const partial =
-        extractRpcAssistantText(errorObj.stdout ?? "") ||
-        extractNonJsonText(errorObj.stdout ?? "");
+      const partial = extractNonJsonText(errorObj.stdout ?? "");
       const partialSnippet =
         partial && partial.length > 800
           ? `${partial.slice(0, 800)}...`

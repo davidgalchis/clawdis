@@ -13,6 +13,10 @@ export type MsgContext = {
   SenderName?: string;
   SenderE164?: string;
   Surface?: string;
+  /** Per-group working directory (for telegram groups) */
+  GroupCwd?: string;
+  /** Per-group default permission mode (for telegram groups) */
+  DefaultPermissionMode?: string;
 };
 
 export type TemplateContext = MsgContext & {

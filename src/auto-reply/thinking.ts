@@ -39,3 +39,32 @@ export function normalizeVerboseLevel(
   if (["on", "full", "true", "yes", "1"].includes(key)) return "on";
   return undefined;
 }
+
+export type PermissionModeLevel =
+  | "default"
+  | "plan"
+  | "bypassPermissions"
+  | "acceptEdits";
+
+// Normalize permission mode strings used for Claude Code --permission-mode flag.
+export function normalizePermissionMode(
+  raw?: string | null,
+): PermissionModeLevel | undefined {
+  if (!raw) return undefined;
+  const key = raw.toLowerCase();
+  if (["default", "normal", "standard"].includes(key)) return "default";
+  if (["plan", "planning", "architect"].includes(key)) return "plan";
+  if (
+    [
+      "bypass",
+      "bypasspermissions",
+      "bypass-permissions",
+      "dangerous",
+      "yolo",
+    ].includes(key)
+  )
+    return "bypassPermissions";
+  if (["accept", "acceptedits", "accept-edits", "auto"].includes(key))
+    return "acceptEdits";
+  return undefined;
+}

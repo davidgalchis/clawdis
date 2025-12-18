@@ -1,12 +1,17 @@
-import { piSpec } from "./pi.js";
+import { claudeCodeSpec } from "./claude-code.js";
 import type { AgentKind, AgentSpec } from "./types.js";
 
 const specs: Record<AgentKind, AgentSpec> = {
-  pi: piSpec,
+  "claude-code": claudeCodeSpec,
 };
 
 export function getAgentSpec(kind: AgentKind): AgentSpec {
   return specs[kind];
 }
 
-export type { AgentKind, AgentMeta, AgentParseResult } from "./types.js";
+export type {
+  AgentKind,
+  AgentMeta,
+  AgentParseResult,
+  PermissionMode,
+} from "./types.js";

@@ -17,7 +17,6 @@ type LaneState = {
   queue: QueueEntry[];
   active: number;
   maxConcurrent: number;
-  draining: boolean;
 };
 
 const lanes = new Map<string, LaneState>();
@@ -30,7 +29,6 @@ function getLaneState(lane: string): LaneState {
     queue: [],
     active: 0,
     maxConcurrent: 1,
-    draining: false,
   };
   lanes.set(lane, created);
   return created;
@@ -38,34 +36,28 @@ function getLaneState(lane: string): LaneState {
 
 function drainLane(lane: string) {
   const state = getLaneState(lane);
-  if (state.draining) return;
-  state.draining = true;
 
-  const pump = () => {
-    while (state.active < state.maxConcurrent && state.queue.length > 0) {
-      const entry = state.queue.shift() as QueueEntry;
-      const waitedMs = Date.now() - entry.enqueuedAt;
-      if (waitedMs >= entry.warnAfterMs) {
-        entry.onWait?.(waitedMs, state.queue.length);
-      }
-      state.active += 1;
-      void (async () => {
-        try {
-          const result = await entry.task();
-          state.active -= 1;
-          pump();
-          entry.resolve(result);
-        } catch (err) {
-          state.active -= 1;
-          pump();
-          entry.reject(err);
-        }
-      })();
+  // Start tasks up to maxConcurrent
+  while (state.active < state.maxConcurrent && state.queue.length > 0) {
+    const entry = state.queue.shift() as QueueEntry;
+    const waitedMs = Date.now() - entry.enqueuedAt;
+    if (waitedMs >= entry.warnAfterMs) {
+      entry.onWait?.(waitedMs, state.queue.length);
     }
-    state.draining = false;
-  };
-
-  pump();
+    state.active += 1;
+    void (async () => {
+      try {
+        const result = await entry.task();
+        state.active -= 1;
+        drainLane(lane); // Try to start more tasks
+        entry.resolve(result);
+      } catch (err) {
+        state.active -= 1;
+        drainLane(lane); // Try to start more tasks
+        entry.reject(err);
+      }
+    })();
+  }
 }
 
 export function setCommandLaneConcurrency(lane: string, maxConcurrent: number) {

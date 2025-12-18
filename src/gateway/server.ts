@@ -24,6 +24,12 @@ import { getHealthSnapshot, type HealthSummary } from "../commands/health.js";
 import { getStatusSummary } from "../commands/status.js";
 import { type ClawdisConfig, loadConfig } from "../config/config.js";
 import {
+  checkSessionCompleted,
+  getPendingRequests,
+  removePending,
+  sessionFileExists,
+} from "../config/pending.js";
+import {
   loadSessionStore,
   resolveStorePath,
   type SessionEntry,
@@ -549,6 +555,7 @@ export async function startGatewayServer(
   const clients = new Set<Client>();
   const cfgAtStart = loadConfig();
   setCommandLaneConcurrency("cron", cfgAtStart.cron?.maxConcurrentRuns ?? 1);
+  setCommandLaneConcurrency("main", cfgAtStart.inbound?.maxConcurrent ?? 1);
 
   const cronStorePath = resolveCronStorePath(cfgAtStart.cron?.store);
   const cronLogger = getChildLogger({
@@ -3015,6 +3022,365 @@ export async function startGatewayServer(
       "gateway: skipping provider start (CLAWDIS_SKIP_PROVIDERS=1)",
     );
   }
+
+  // Recover any pending requests that were interrupted by a restart
+  const recoverPendingRequests = async () => {
+    const pending = getPendingRequests();
+    if (pending.length === 0) return;
+
+    defaultRuntime.log(
+      `gateway: checking ${pending.length} pending request(s) for recovery`,
+    );
+
+    const cfg = loadConfig();
+    const telegramToken =
+      process.env.TELEGRAM_BOT_TOKEN ?? cfg.telegram?.botToken ?? "";
+
+    // Process each pending request in parallel
+    const recoverOne = async (req: (typeof pending)[0]) => {
+      if (!req.sessionId) {
+        // No session ID recorded - can't recover
+        const key = `${req.surface}:${req.chatId}`;
+        removePending(key);
+        return;
+      }
+
+      const { completed, result } = checkSessionCompleted(
+        req.sessionId,
+        req.cwd,
+      );
+      const key = `${req.surface}:${req.chatId}`;
+
+      if (completed && result) {
+        // Session completed - deliver the result
+        defaultRuntime.log(
+          `gateway: recovering completed session ${req.sessionId.slice(0, 8)}... for ${req.surface}:${req.chatId}`,
+        );
+
+        if (req.surface === "telegram" && telegramToken) {
+          try {
+            await sendMessageTelegram(
+              req.chatId,
+              `🔄 Recovered from restart:\n\n${result}`,
+              { token: telegramToken },
+            );
+            defaultRuntime.log(
+              `gateway: recovery delivered to telegram:${req.chatId}`,
+            );
+          } catch (err) {
+            logError(
+              `gateway: failed to deliver recovered message: ${String(err)}`,
+            );
+          }
+        }
+        removePending(key);
+      } else {
+        // Session didn't complete - resume it
+        // Check if the Claude session file actually exists before attempting resume
+        if (!sessionFileExists(req.sessionId, req.cwd)) {
+          defaultRuntime.log(
+            `gateway: session file not found for ${req.sessionId.slice(0, 8)}... - removing pending`,
+          );
+          removePending(key);
+          return;
+        }
+
+        defaultRuntime.log(
+          `gateway: resuming interrupted session ${req.sessionId.slice(0, 8)}... for ${req.surface}:${req.chatId}`,
+        );
+
+        // Resume the session by running Claude with --resume
+        if (req.surface === "telegram" && telegramToken) {
+          try {
+            // Send "resuming" notification with task context if available
+            const taskHint = req.message
+              ? `\n\n_Task: ${req.message.slice(0, 100)}${req.message.length > 100 ? "..." : ""}_`
+              : "";
+            // Get project name from cwd if available
+            const projectName = req.cwd ? req.cwd.split("/").pop() : undefined;
+            const projectHint = projectName ? ` (${projectName})` : "";
+            await sendMessageTelegram(
+              req.chatId,
+              `🔄 Resuming interrupted session${projectHint}...${taskHint}`,
+              { token: telegramToken },
+            );
+
+            // Run Claude Code to resume the session with streaming progress
+            const { runClaudeCode } = await import(
+              "../process/claude-code-runner.js"
+            );
+            const { Bot } = await import("grammy");
+            const bot = new Bot(telegramToken);
+
+            defaultRuntime.log(
+              `gateway: running claude --resume ${req.sessionId.slice(0, 8)}... in ${req.cwd}`,
+            );
+
+            // Track progress in editable message
+            let progressMsgId: number | undefined;
+            const toolHistory: string[] = [];
+            let lastEditTime = 0;
+            const EDIT_THROTTLE_MS = 1500;
+            const resumeStartTime = Date.now();
+
+            const formatElapsed = () => {
+              const elapsed = Math.floor((Date.now() - resumeStartTime) / 1000);
+              if (elapsed < 60) return `${elapsed}s`;
+              const mins = Math.floor(elapsed / 60);
+              const secs = elapsed % 60;
+              return `${mins}m${secs}s`;
+            };
+
+            // Auto-continue settings
+            const MAX_CONTINUE_ATTEMPTS = 50;
+            let continueAttempts = 0;
+            let currentSessionId = req.sessionId;
+            const allResponses: string[] = [];
+
+            // Import claudeCodeSpec once
+            const { claudeCodeSpec } = await import("../agents/claude-code.js");
+
+            // Helper to update progress message
+            const updateProgress = async (header: string) => {
+              const progressText = toolHistory.length > 0
+                ? toolHistory.slice(-8).join("\n")
+                : "_Working..._";
+              try {
+                if (!progressMsgId) {
+                  const sent = await bot.api.sendMessage(
+                    req.chatId,
+                    `${header}\n${progressText}`,
+                  );
+                  progressMsgId = sent.message_id;
+                } else {
+                  await bot.api.editMessageText(
+                    req.chatId,
+                    progressMsgId,
+                    `${header}\n${progressText}`,
+                  );
+                }
+                lastEditTime = Date.now();
+              } catch {
+                // Ignore edit errors
+              }
+            };
+
+            // Auto-continue loop
+            while (true) {
+              const isFirstAttempt = continueAttempts === 0;
+              const prompt = isFirstAttempt
+                ? "Continue from where you left off. The session was interrupted by a restart."
+                : "Please continue where you left off and complete the task.";
+
+              // Track session ID from this run
+              let newSessionId: string | undefined;
+
+              // Heartbeat interval to update elapsed time every 5 seconds
+              const HEARTBEAT_MS = 5000;
+              const heartbeat = setInterval(() => {
+                const header = `🔄 Resuming... (${formatElapsed()})`;
+                void updateProgress(header);
+              }, HEARTBEAT_MS);
+
+              const resumeResult = await runClaudeCode({
+                argv: [
+                  "claude",
+                  "-p",
+                  "--resume",
+                  currentSessionId,
+                  "--fork-session",
+                  "--output-format",
+                  "stream-json",
+                  "--verbose",
+                  "--permission-mode",
+                  "bypassPermissions",
+                  prompt,
+                ],
+                cwd: req.cwd,
+                timeoutMs: 24 * 60 * 60 * 1000, // 24 hour timeout
+                onLine: async (line: string) => {
+                  try {
+                    const ev = JSON.parse(line) as {
+                      type?: string;
+                      subtype?: string;
+                      session_id?: string;
+                      message?: {
+                        role?: string;
+                        content?: Array<{
+                          type?: string;
+                          name?: string;
+                          input?: Record<string, unknown>;
+                        }>;
+                      };
+                    };
+
+                    // Capture new session ID from init event
+                    if (ev.type === "system" && ev.subtype === "init" && ev.session_id) {
+                      newSessionId = ev.session_id;
+                    }
+
+                    if (ev.type === "assistant" && ev.message?.content) {
+                      for (const c of ev.message.content) {
+                        if (c.type === "tool_use" && c.name) {
+                          const toolName = c.name;
+                          const input = c.input ?? {};
+                          let detail = "";
+
+                          if (toolName === "Read" && input.file_path) {
+                            detail = ` ${input.file_path}`;
+                          } else if (toolName === "Bash" && input.command) {
+                            const cmd = String(input.command).slice(0, 50);
+                            detail = ` \`${cmd}...\``;
+                          } else if (toolName === "Edit" && input.file_path) {
+                            detail = ` ${input.file_path}`;
+                          }
+
+                          toolHistory.push(`🔧 ${toolName}${detail}`);
+
+                          const now = Date.now();
+                          if (now - lastEditTime >= EDIT_THROTTLE_MS) {
+                            const progressText = toolHistory.slice(-8).join("\n");
+                            const header = `🔄 Resuming... (${formatElapsed()})`;
+                            try {
+                              if (!progressMsgId) {
+                                const sent = await bot.api.sendMessage(
+                                  req.chatId,
+                                  `${header}\n${progressText}`,
+                                );
+                                progressMsgId = sent.message_id;
+                              } else {
+                                await bot.api.editMessageText(
+                                  req.chatId,
+                                  progressMsgId,
+                                  `${header}\n${progressText}`,
+                                );
+                              }
+                              lastEditTime = now;
+                            } catch {
+                              // Ignore edit errors
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } catch {
+                    // Ignore parse errors
+                  }
+                },
+              });
+
+              // Stop heartbeat
+              clearInterval(heartbeat);
+
+              // Parse the result
+              const parsed = claudeCodeSpec.parseOutput(resumeResult.stdout);
+              const responseText = parsed?.texts?.join("\n\n")?.trim() || "";
+
+              if (responseText) {
+                allResponses.push(responseText);
+              }
+
+              // Detect incomplete output
+              const trimmedLast = responseText.trim();
+              const textLooksIncomplete =
+                responseText.length > 0 &&
+                (/[:]\s*$/.test(trimmedLast) ||
+                  /\b(now|next|try|check|run|test|let me|going to)\s*[:.!]?\s*$/i.test(trimmedLast));
+              const processWasKilled = resumeResult.killed || resumeResult.timedOut;
+              const noOutputButToolsRan = responseText.length === 0 && toolHistory.length > 0;
+              const outputLooksIncomplete = textLooksIncomplete || processWasKilled || noOutputButToolsRan;
+
+              // Check if we should auto-continue
+              if (
+                outputLooksIncomplete &&
+                continueAttempts < MAX_CONTINUE_ATTEMPTS &&
+                resumeResult.code === 0
+              ) {
+                continueAttempts++;
+                defaultRuntime.log(
+                  `gateway: recovery auto-continue ${continueAttempts}/${MAX_CONTINUE_ATTEMPTS} (output looked incomplete)`,
+                );
+
+                // Update session ID for next run (use forked session)
+                if (newSessionId) {
+                  currentSessionId = newSessionId;
+                }
+
+                // Update progress message to show continuing
+                if (progressMsgId) {
+                  try {
+                    const progressText = toolHistory.slice(-8).join("\n");
+                    await bot.api.editMessageText(
+                      req.chatId,
+                      progressMsgId,
+                      `🔄 Continuing... (${formatElapsed()})\n${progressText}`,
+                    );
+                  } catch {
+                    // Ignore
+                  }
+                }
+
+                continue; // Go to next iteration
+              }
+
+              // Done - break out of loop
+              break;
+            }
+
+            // Delete progress message
+            if (progressMsgId) {
+              try {
+                await bot.api.deleteMessage(req.chatId, progressMsgId);
+              } catch {
+                // Ignore
+              }
+            }
+
+            // Combine all responses
+            const combinedResponse = allResponses.join("\n\n").trim();
+
+            if (!combinedResponse) {
+              defaultRuntime.log(
+                `gateway: resume produced no text output after ${continueAttempts + 1} attempt(s)`,
+              );
+            }
+
+            const finalMessage = combinedResponse
+              ? `🔄 Resumed after restart:\n\n${combinedResponse}`
+              : `🔄 Session resumed but produced no output. You may need to send a new message.`;
+
+            await sendMessageTelegram(req.chatId, finalMessage, {
+              token: telegramToken,
+            });
+            defaultRuntime.log(
+              `gateway: resume delivered to telegram:${req.chatId} (${combinedResponse.length} chars, ${continueAttempts + 1} attempt(s))`,
+            );
+          } catch (err) {
+            logError(`gateway: failed to resume session: ${String(err)}`);
+            // Notify user of failure
+            try {
+              await sendMessageTelegram(
+                req.chatId,
+                `⚠️ Failed to resume interrupted session: ${String(err)}`,
+                { token: telegramToken },
+              );
+            } catch {
+              // Ignore notification failure
+            }
+          }
+        }
+        removePending(key);
+      }
+    };
+
+    // Run all recoveries in parallel
+    await Promise.all(pending.map((req) => recoverOne(req)));
+  };
+
+  // Run recovery after a short delay to let providers initialize
+  setTimeout(() => {
+    void recoverPendingRequests();
+  }, 3000);
 
   return {
     close: async () => {

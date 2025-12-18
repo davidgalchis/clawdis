@@ -1,4 +1,4 @@
-export type AgentKind = "pi";
+export type AgentKind = "claude-code";
 
 export type AgentMeta = {
   model?: string;
@@ -29,6 +29,13 @@ export type AgentParseResult = {
   meta?: AgentMeta;
 };
 
+export type PermissionMode =
+  | "default"
+  | "plan"
+  | "bypassPermissions"
+  | "acceptEdits"
+  | "dontAsk";
+
 export type BuildArgsContext = {
   argv: string[];
   bodyIndex: number; // index of prompt/body argument in argv
@@ -42,6 +49,8 @@ export type BuildArgsContext = {
   format?: "text" | "json";
   sessionArgNew?: string[];
   sessionArgResume?: string[];
+  permissionMode?: PermissionMode;
+  cwd?: string;
 };
 
 export interface AgentSpec {

@@ -26,6 +26,19 @@ export type SessionConfig = {
   mainKey?: string;
 };
 
+export type ProgressConfig = {
+  /** Show Task/Agent tool descriptions. Default: true */
+  taskDescriptions?: boolean;
+  /** Show thinking block previews. Default: false */
+  thinkingPreviews?: boolean;
+  /** Max chars for thinking preview. Default: 100 */
+  thinkingMaxChars?: number;
+  /** Show streaming text as it arrives. Default: false */
+  streamingText?: boolean;
+  /** Max chars for streaming text preview. Default: 200 */
+  streamingMaxChars?: number;
+};
+
 export type LoggingConfig = {
   level?: "silent" | "fatal" | "error" | "warn" | "info" | "debug" | "trace";
   file?: string;
@@ -67,6 +80,12 @@ export type CronConfig = {
   maxConcurrentRuns?: number;
 };
 
+export type TelegramGroupConfig = {
+  cwd?: string;
+  name?: string;
+  permissionMode?: "default" | "plan" | "bypassPermissions" | "acceptEdits";
+};
+
 export type TelegramConfig = {
   botToken?: string;
   requireMention?: boolean;
@@ -76,6 +95,8 @@ export type TelegramConfig = {
   webhookUrl?: string;
   webhookSecret?: string;
   webhookPath?: string;
+  /** Per-group configuration: chatId -> config */
+  groups?: Record<string, TelegramGroupConfig>;
 };
 
 export type GroupChatConfig = {
@@ -105,6 +126,8 @@ export type ClawdisConfig = {
       timeoutSeconds?: number;
     };
     groupChat?: GroupChatConfig;
+    /** Max concurrent command replies (default: 1 = serialized) */
+    maxConcurrent?: number;
     reply?: {
       mode: ReplyMode;
       text?: string;
@@ -121,6 +144,12 @@ export type ClawdisConfig = {
       mediaMaxMb?: number;
       typingIntervalSeconds?: number;
       heartbeatMinutes?: number;
+      /** Auto-continue when agent output looks incomplete (max 3 retries). Default: false */
+      autoContinue?: boolean;
+      /** Max auto-continue attempts (default: 3) */
+      autoContinueMax?: number;
+      /** Progress visibility settings for streaming updates */
+      progress?: ProgressConfig;
       agent?: {
         kind: AgentKind;
         format?: "text" | "json";
@@ -186,9 +215,20 @@ const ReplySchema = z
       })
       .optional(),
     heartbeatMinutes: z.number().int().nonnegative().optional(),
+    autoContinue: z.boolean().optional(),
+    autoContinueMax: z.number().int().positive().optional(),
+    progress: z
+      .object({
+        taskDescriptions: z.boolean().optional(),
+        thinkingPreviews: z.boolean().optional(),
+        thinkingMaxChars: z.number().int().positive().optional(),
+        streamingText: z.boolean().optional(),
+        streamingMaxChars: z.number().int().positive().optional(),
+      })
+      .optional(),
     agent: z
       .object({
-        kind: z.literal("pi"),
+        kind: z.literal("claude-code"),
         format: z.union([z.literal("text"), z.literal("json")]).optional(),
         identityPrefix: z.string().optional(),
         provider: z.string().optional(),
@@ -261,6 +301,7 @@ const ClawdisSchema = z.object({
           timeoutSeconds: z.number().int().positive().optional(),
         })
         .optional(),
+      maxConcurrent: z.number().int().positive().optional(),
       reply: ReplySchema.optional(),
     })
     .optional(),
@@ -301,6 +342,23 @@ const ClawdisSchema = z.object({
       webhookUrl: z.string().optional(),
       webhookSecret: z.string().optional(),
       webhookPath: z.string().optional(),
+      groups: z
+        .record(
+          z.string(),
+          z.object({
+            cwd: z.string().optional(),
+            name: z.string().optional(),
+            permissionMode: z
+              .union([
+                z.literal("default"),
+                z.literal("plan"),
+                z.literal("bypassPermissions"),
+                z.literal("acceptEdits"),
+              ])
+              .optional(),
+          }),
+        )
+        .optional(),
     })
     .optional(),
 });
