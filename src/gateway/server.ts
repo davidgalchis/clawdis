@@ -3285,6 +3285,8 @@ export async function startGatewayServer(
               const textLooksIncomplete =
                 responseText.length > 0 &&
                 (/[:]\s*$/.test(trimmedLast) ||
+                  /[?]\s*$/.test(trimmedLast) ||
+                  /\b(next step|here'?s what|i('ll| will) (now|next)|let me|going to)\b/i.test(trimmedLast) ||
                   /\b(now|next|try|check|run|test|let me|going to)\s*[:.!]?\s*$/i.test(trimmedLast));
               const processWasKilled = resumeResult.killed || resumeResult.timedOut;
               const noOutputButToolsRan = responseText.length === 0 && toolHistory.length > 0;
