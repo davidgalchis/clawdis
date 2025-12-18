@@ -6,7 +6,6 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PROVIDER,
 } from "../agents/defaults.js";
-import { resolveBundledPiBinary } from "../agents/pi-path.js";
 import {
   DEFAULT_AGENT_WORKSPACE_DIR,
   ensureAgentWorkspace,
@@ -25,6 +24,8 @@ import { isVerbose, logVerbose } from "../globals.js";
 import { buildProviderSummary } from "../infra/provider-summary.js";
 import { triggerClawdisRestart } from "../infra/restart.js";
 import { drainSystemEvents } from "../infra/system-events.js";
+import { cancelClaudeProcess } from "../process/claude-code-runner.js";
+import { enqueueCommandInLane } from "../process/command-queue.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveHeartbeatSeconds } from "../web/reconnect.js";
@@ -37,8 +38,10 @@ import {
   type TemplateContext,
 } from "./templating.js";
 import {
+  normalizePermissionMode,
   normalizeThinkLevel,
   normalizeVerboseLevel,
+  type PermissionModeLevel,
   type ThinkLevel,
   type VerboseLevel,
 } from "./thinking.js";
@@ -47,7 +50,14 @@ import type { GetReplyOptions, ReplyPayload } from "./types.js";
 
 export type { GetReplyOptions, ReplyPayload } from "./types.js";
 
-const ABORT_TRIGGERS = new Set(["stop", "esc", "abort", "wait", "exit"]);
+const ABORT_TRIGGERS = new Set([
+  "stop",
+  "esc",
+  "abort",
+  "wait",
+  "exit",
+  "cancel",
+]);
 const ABORT_MEMORY = new Map<string, boolean>();
 const SYSTEM_MARK = "⚙️";
 
@@ -100,6 +110,51 @@ export function extractVerboseDirective(body?: string): {
   };
 }
 
+export function extractModeDirective(body?: string): {
+  cleaned: string;
+  permissionMode?: PermissionModeLevel;
+  rawMode?: string;
+  hasDirective: boolean;
+} {
+  if (!body) return { cleaned: "", hasDirective: false };
+  // Match /mode:plan, /mode:bypass, /mode:default, /mode:accept, etc.
+  const match = body.match(
+    /(?:^|\s)\/(?:mode|m)(?=$|\s|:)\s*:?\s*([a-zA-Z-]+)\b/i,
+  );
+  const permissionMode = normalizePermissionMode(match?.[1]);
+  const cleaned = match
+    ? body.replace(match[0], "").replace(/\s+/g, " ").trim()
+    : body.trim();
+  return {
+    cleaned,
+    permissionMode,
+    rawMode: match?.[1],
+    hasDirective: !!match,
+  };
+}
+
+export function extractResumeDirective(body?: string): {
+  cleaned: string;
+  sessionId?: string;
+  hasDirective: boolean;
+} {
+  if (!body) return { cleaned: "", hasDirective: false };
+  // Match /resume:uuid, /resume uuid, /r:uuid, /r uuid
+  // UUID pattern: 8-4-4-4-12 hex chars (with optional hyphens)
+  const match = body.match(
+    /(?:^|\s)\/(?:resume|r)(?=$|\s|:)\s*:?\s*([a-f0-9-]{8,36})\b/i,
+  );
+  const sessionId = match?.[1]?.toLowerCase();
+  const cleaned = match
+    ? body.replace(match[0], "").replace(/\s+/g, " ").trim()
+    : body.trim();
+  return {
+    cleaned,
+    sessionId,
+    hasDirective: !!match,
+  };
+}
+
 function isAbortTrigger(text?: string): boolean {
   if (!text) return false;
   const normalized = text.trim().toLowerCase();
@@ -147,15 +202,14 @@ function stripMentions(
   return result.replace(/\s+/g, " ").trim();
 }
 
-function makeDefaultPiReply(): ResolvedReplyConfig {
-  const piBin = resolveBundledPiBinary() ?? "pi";
+function makeDefaultClaudeCodeReply(): ResolvedReplyConfig {
   const defaultContext =
     lookupContextTokens(DEFAULT_MODEL) ?? DEFAULT_CONTEXT_TOKENS;
   return {
     mode: "command" as const,
-    command: [piBin, "--mode", "rpc", "{{BodyStripped}}"],
+    command: ["claude", "-p", "{{BodyStripped}}"],
     agent: {
-      kind: "pi" as const,
+      kind: "claude-code" as const,
       provider: DEFAULT_PROVIDER,
       model: DEFAULT_MODEL,
       contextTokens: defaultContext,
@@ -178,10 +232,15 @@ export async function getReplyFromConfig(
   // Choose reply from config: static text or external command stdout.
   const cfg = configOverride ?? loadConfig();
   const workspaceDir = cfg.inbound?.workspace ?? DEFAULT_AGENT_WORKSPACE_DIR;
+  // Per-group cwd takes precedence over config
+  const effectiveCwd = ctx.GroupCwd ?? workspaceDir;
   const configuredReply = cfg.inbound?.reply as ResolvedReplyConfig | undefined;
   const reply: ResolvedReplyConfig = configuredReply
-    ? { ...configuredReply, cwd: configuredReply.cwd ?? workspaceDir }
-    : { ...makeDefaultPiReply(), cwd: workspaceDir };
+    ? {
+        ...configuredReply,
+        cwd: ctx.GroupCwd ?? configuredReply.cwd ?? workspaceDir,
+      }
+    : { ...makeDefaultClaudeCodeReply(), cwd: effectiveCwd };
   const identity = cfg.identity;
   if (identity?.name?.trim() && reply.session && !reply.session.sessionIntro) {
     const name = identity.name.trim();
@@ -273,6 +332,8 @@ export async function getReplyFromConfig(
 
   let persistedThinking: string | undefined;
   let persistedVerbose: string | undefined;
+  // Preserve original session ID for directive-only messages (don't reset on idle)
+  let originalSessionId: string | undefined;
 
   const triggerBodyNormalized = stripStructuralPrefixes(ctx.Body ?? "")
     .trim()
@@ -306,8 +367,9 @@ export async function getReplyFromConfig(
     sessionKey = resolveSessionKey(sessionScope, ctx, mainKey);
     sessionStore = loadSessionStore(storePath);
     const entry = sessionStore[sessionKey];
-    const idleMs = idleMinutes * 60_000;
-    const freshEntry = entry && Date.now() - entry.updatedAt <= idleMs;
+    // Session is always "fresh" if it exists - no idle timeout reset
+    const freshEntry = !!entry;
+    originalSessionId = entry?.sessionId;
 
     if (!isNewSession && freshEntry) {
       sessionId = entry.sessionId;
@@ -356,8 +418,28 @@ export async function getReplyFromConfig(
     rawLevel: rawVerboseLevel,
     hasDirective: hasVerboseDirective,
   } = extractVerboseDirective(thinkCleaned);
-  sessionCtx.Body = verboseCleaned;
-  sessionCtx.BodyStripped = verboseCleaned;
+  const {
+    cleaned: modeCleaned,
+    permissionMode: inlineMode,
+    rawMode: rawModeLevel,
+    hasDirective: hasModeDirective,
+  } = extractModeDirective(verboseCleaned);
+  const {
+    cleaned: resumeCleaned,
+    sessionId: resumeSessionId,
+    hasDirective: hasResumeDirective,
+  } = extractResumeDirective(modeCleaned);
+
+  // If /resume:uuid directive provided, override the session ID
+  if (resumeSessionId) {
+    sessionId = resumeSessionId;
+    isNewSession = false; // Resuming an existing session
+    sessionCtx.SessionId = resumeSessionId;
+    sessionCtx.IsNewSession = "false";
+  }
+
+  sessionCtx.Body = resumeCleaned;
+  sessionCtx.BodyStripped = resumeCleaned;
 
   const isGroup =
     typeof ctx.From === "string" &&
@@ -377,7 +459,7 @@ export async function getReplyFromConfig(
     hasThinkDirective &&
     hasVerboseDirective &&
     (() => {
-      const stripped = stripStructuralPrefixes(verboseCleaned ?? "");
+      const stripped = stripStructuralPrefixes(resumeCleaned ?? "");
       const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
       return noMentions.length === 0;
     })();
@@ -386,7 +468,25 @@ export async function getReplyFromConfig(
     if (!hasThinkDirective) return false;
     if (!thinkCleaned) return true;
     // Check after stripping both think and verbose so combined directives count.
-    const stripped = stripStructuralPrefixes(verboseCleaned);
+    const stripped = stripStructuralPrefixes(resumeCleaned);
+    const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
+    return noMentions.length === 0;
+  })();
+
+  // Check if this is a mode-only directive
+  const modeDirectiveOnly = (() => {
+    if (!hasModeDirective) return false;
+    if (!resumeCleaned) return true;
+    const stripped = stripStructuralPrefixes(resumeCleaned);
+    const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
+    return noMentions.length === 0;
+  })();
+
+  // Check if this is a resume-only directive
+  const resumeDirectiveOnly = (() => {
+    if (!hasResumeDirective) return false;
+    if (!resumeCleaned) return true;
+    const stripped = stripStructuralPrefixes(resumeCleaned);
     const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;
     return noMentions.length === 0;
   })();
@@ -400,6 +500,10 @@ export async function getReplyFromConfig(
       };
     }
     if (sessionEntry && sessionStore && sessionKey) {
+      // Preserve original session ID - don't reset on idle for directive-only
+      if (originalSessionId) {
+        sessionEntry.sessionId = originalSessionId;
+      }
       if (inlineThink === "off") {
         delete sessionEntry.thinkingLevel;
       } else {
@@ -466,6 +570,10 @@ export async function getReplyFromConfig(
       };
     }
     if (sessionEntry && sessionStore && sessionKey) {
+      // Preserve original session ID - don't reset on idle for directive-only
+      if (originalSessionId) {
+        sessionEntry.sessionId = originalSessionId;
+      }
       if (inlineVerbose === "off") {
         delete sessionEntry.verboseLevel;
       } else {
@@ -483,7 +591,62 @@ export async function getReplyFromConfig(
     return { text: ack };
   }
 
-  // Persist inline think/verbose settings even when additional content follows.
+  // Handle mode-only directive (e.g., "/mode:plan" with no other content)
+  if (modeDirectiveOnly) {
+    if (!inlineMode) {
+      cleanupTyping();
+      return {
+        text: `Unrecognized permission mode "${rawModeLevel ?? ""}". Valid modes: default, plan, bypass, accept.`,
+      };
+    }
+    // Persist the mode change (preserve original session ID - don't reset on idle)
+    if (sessionEntry && sessionStore && sessionKey) {
+      if (originalSessionId) {
+        sessionEntry.sessionId = originalSessionId;
+      }
+      if (inlineMode === "default") {
+        delete sessionEntry.permissionMode;
+      } else {
+        sessionEntry.permissionMode = inlineMode;
+      }
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
+    const modeDescriptions: Record<PermissionModeLevel, string> = {
+      default: "Default mode (will ask for permissions)",
+      plan: "Plan mode (read-only exploration)",
+      bypassPermissions:
+        "Bypass permissions mode (dangerous - no confirmations)",
+      acceptEdits: "Accept edits mode (auto-approve file changes)",
+    };
+    const ack = `${SYSTEM_MARK} ${modeDescriptions[inlineMode]}`;
+    cleanupTyping();
+    return { text: ack };
+  }
+
+  // Handle resume-only directive (e.g., "/resume:uuid" with no other content)
+  if (resumeDirectiveOnly) {
+    if (!resumeSessionId) {
+      cleanupTyping();
+      return {
+        text: `${SYSTEM_MARK} Usage: /resume:<session-id> or /r:<session-id>`,
+      };
+    }
+    // Update the session store with the new session ID
+    if (sessionEntry && sessionStore && sessionKey) {
+      sessionEntry.sessionId = resumeSessionId;
+      sessionEntry.updatedAt = Date.now();
+      sessionStore[sessionKey] = sessionEntry;
+      await saveSessionStore(storePath, sessionStore);
+    }
+    const shortId = resumeSessionId.slice(0, 8);
+    const ack = `${SYSTEM_MARK} Resuming session ${shortId}…`;
+    cleanupTyping();
+    return { text: ack };
+  }
+
+  // Persist inline think/verbose/mode settings even when additional content follows.
   if (sessionEntry && sessionStore && sessionKey) {
     let updated = false;
     if (hasThinkDirective && inlineThink) {
@@ -499,6 +662,14 @@ export async function getReplyFromConfig(
         delete sessionEntry.verboseLevel;
       } else {
         sessionEntry.verboseLevel = inlineVerbose;
+      }
+      updated = true;
+    }
+    if (hasModeDirective && inlineMode) {
+      if (inlineMode === "default") {
+        delete sessionEntry.permissionMode;
+      } else {
+        sessionEntry.permissionMode = inlineMode;
       }
       updated = true;
     }
@@ -584,6 +755,10 @@ export async function getReplyFromConfig(
     reply?.mode === "command" && isAbortTrigger(rawBodyNormalized);
 
   if (abortRequested) {
+    // Actually kill the running process using the chat ID as tracking ID
+    const trackingId = ctx.From ?? sessionKey ?? "main";
+    const wasKilled = cancelClaudeProcess(trackingId);
+
     if (sessionEntry && sessionStore && sessionKey) {
       sessionEntry.abortedLastRun = true;
       sessionEntry.updatedAt = Date.now();
@@ -593,7 +768,11 @@ export async function getReplyFromConfig(
       ABORT_MEMORY.set(abortKey, true);
     }
     cleanupTyping();
-    return { text: "⚙️ Agent was aborted." };
+    return {
+      text: wasKilled
+        ? "🛑 Agent cancelled - process killed."
+        : "⚙️ Agent was aborted (no running process found).",
+    };
   }
 
   await startTypingLoop();
@@ -624,6 +803,10 @@ export async function getReplyFromConfig(
             );
         })()
       : "";
+  // Encourage Claude to complete work fully instead of stopping mid-task
+  // Apply to all turns so existing sessions also get the nudge
+  const completionHint =
+    "Important: Complete your work fully before responding. If you start an action, follow through to completion. Don't leave tasks half-done or say 'let me try X' without actually doing it and reporting the result.";
   const bodyPrefix = reply?.bodyPrefix
     ? applyTemplate(reply.bodyPrefix ?? "", sessionCtx)
     : "";
@@ -675,6 +858,9 @@ export async function getReplyFromConfig(
       ABORT_MEMORY.set(abortKey, false);
     }
   }
+  if (completionHint) {
+    prefixedBodyBase = `${completionHint}\n\n${prefixedBodyBase}`;
+  }
 
   // Prepend queued system events and (for new main sessions) a provider snapshot.
   const isGroupSession =
@@ -695,13 +881,9 @@ export async function getReplyFromConfig(
       prefixedBodyBase = `${block}\n\n${prefixedBodyBase}`;
     }
   }
-  if (
-    sessionCfg &&
-    sendSystemOnce &&
-    isFirstTurnInSession &&
-    sessionStore &&
-    sessionKey
-  ) {
+  // Always mark systemSent after first turn so subsequent turns use --resume instead of --session-id
+  // (Previously this only ran when sendSystemOnce was true, causing "session already in use" errors)
+  if (sessionCfg && isFirstTurnInSession && sessionStore && sessionKey) {
     const current = sessionEntry ??
       sessionStore[sessionKey] ?? {
         sessionId: sessionId ?? crypto.randomUUID(),
@@ -772,6 +954,9 @@ export async function getReplyFromConfig(
 
   const isHeartbeat = opts?.isHeartbeat === true;
 
+  // Note: onSessionReady is called from within runCommandReply when Claude
+  // reports its actual session ID (which may differ for forked sessions)
+
   if (reply && reply.mode === "command") {
     const heartbeatCommand = isHeartbeat
       ? (reply as { heartbeatCommand?: string[] }).heartbeatCommand
@@ -792,29 +977,115 @@ export async function getReplyFromConfig(
       mode: "command" as const,
     };
     try {
-      const runResult = await runCommandReply({
-        reply: commandReply,
-        templatingCtx,
-        sendSystemOnce,
-        isNewSession,
-        isFirstTurnInSession,
-        systemSent,
-        timeoutMs,
-        timeoutSeconds,
-        thinkLevel: resolvedThinkLevel,
-        verboseLevel: resolvedVerboseLevel,
-        onPartialReply: opts?.onPartialReply,
-      });
-      const payloadArray = runResult.payloads ?? [];
-      const meta = runResult.meta;
-      let finalPayloads = payloadArray;
+      // Auto-continue settings
+      const autoContinue = reply.autoContinue === true;
+      const autoContinueMax = reply.autoContinueMax ?? 3;
+      let continueAttempts = 0;
+      let allPayloads: ReplyPayload[] = [];
+      let currentTemplatingCtx = templatingCtx;
+      let currentIsNewSession = isNewSession;
+      let currentIsFirstTurn = isFirstTurnInSession;
+      let lastMeta:
+        | Awaited<ReturnType<typeof runCommandReply>>["meta"]
+        | undefined;
+
+      // Run command, potentially with auto-continue
+      while (true) {
+        // Use chat ID as tracking ID for cancellation and per-chat queue lane
+        const trackingId = ctx.From ?? sessionKey ?? "main";
+
+        // Per-chat enqueue function - serializes messages within the same chat
+        // but allows different chats to run in parallel
+        const perChatEnqueue = <T>(
+          task: () => Promise<T>,
+          enqueueOpts?: {
+            warnAfterMs?: number;
+            onWait?: (waitMs: number, queuedAhead: number) => void;
+          },
+        ) => enqueueCommandInLane(trackingId, task, enqueueOpts);
+
+        const runResult = await runCommandReply({
+          reply: commandReply,
+          templatingCtx: currentTemplatingCtx,
+          sendSystemOnce,
+          isNewSession: currentIsNewSession,
+          isFirstTurnInSession: currentIsFirstTurn,
+          systemSent,
+          timeoutMs,
+          timeoutSeconds,
+          enqueue: perChatEnqueue,
+          thinkLevel: resolvedThinkLevel,
+          verboseLevel: resolvedVerboseLevel,
+          onPartialReply: opts?.onPartialReply,
+          onSessionReady: opts?.onSessionReady,
+          permissionMode:
+            inlineMode ??
+            normalizePermissionMode(sessionEntry?.permissionMode) ??
+            normalizePermissionMode(ctx.DefaultPermissionMode),
+          autoContinue,
+          autoContinueMax,
+          trackingId,
+          progressConfig: commandReply.progress,
+        });
+
+        const payloadArray = runResult.payloads ?? [];
+        lastMeta = runResult.meta;
+
+        // Accumulate payloads
+        allPayloads = [...allPayloads, ...payloadArray];
+
+        // Update session ID if changed
+        const returnedSessionId = lastMeta?.agentMeta?.sessionId;
+        if (returnedSessionId && returnedSessionId !== sessionId) {
+          sessionId = returnedSessionId;
+          currentTemplatingCtx = {
+            ...currentTemplatingCtx,
+            SessionId: sessionId,
+          };
+        }
+
+        // Check if we should auto-continue
+        if (
+          autoContinue &&
+          lastMeta?.looksIncomplete &&
+          continueAttempts < autoContinueMax &&
+          lastMeta?.exitCode === 0
+        ) {
+          continueAttempts++;
+          logVerbose(
+            `Auto-continue attempt ${continueAttempts}/${autoContinueMax} (output looked incomplete)`,
+          );
+
+          // Update context for continuation - just send "continue" as the body
+          currentTemplatingCtx = {
+            ...currentTemplatingCtx,
+            Body: "Please continue where you left off and complete the task.",
+            BodyStripped:
+              "Please continue where you left off and complete the task.",
+          };
+          currentIsNewSession = false;
+          currentIsFirstTurn = false;
+
+          // Notify partial reply about continuation
+          if (opts?.onPartialReply) {
+            await opts.onPartialReply({ text: "🔄 _Continuing..._" });
+          }
+
+          continue; // Loop again
+        }
+
+        break; // Done, exit loop
+      }
+
+      const meta = lastMeta!;
+      let finalPayloads = allPayloads;
       if (!finalPayloads || finalPayloads.length === 0) {
         return undefined;
       }
       if (sessionCfg && sessionStore && sessionKey) {
         const returnedSessionId = meta.agentMeta?.sessionId;
-        // TODO: remove once pi-mono persists stable session ids for custom --session paths.
-        const allowMetaSessionId = false;
+        // Claude Code with --fork-session returns a new session ID that we need to persist
+        const allowMetaSessionId = true;
         if (
           allowMetaSessionId &&
           returnedSessionId &&
@@ -827,13 +1098,16 @@ export async function getReplyFromConfig(
               systemSent,
               abortedLastRun,
             };
+          // Reload session store to avoid race condition with concurrent requests
+          const freshStore = loadSessionStore(storePath);
+          const freshEntry = freshStore[sessionKey] ?? entry;
           sessionEntry = {
-            ...entry,
+            ...freshEntry,
             sessionId: returnedSessionId,
             updatedAt: Date.now(),
           };
-          sessionStore[sessionKey] = sessionEntry;
-          await saveSessionStore(storePath, sessionStore);
+          freshStore[sessionKey] = sessionEntry;
+          await saveSessionStore(storePath, freshStore);
           sessionId = returnedSessionId;
           if (isVerbose()) {
             logVerbose(
@@ -855,7 +1129,9 @@ export async function getReplyFromConfig(
           DEFAULT_CONTEXT_TOKENS;
 
         if (usage) {
-          const entry = sessionEntry ?? sessionStore[sessionKey];
+          // Reload to avoid race condition with concurrent requests
+          const usageStore = loadSessionStore(storePath);
+          const entry = usageStore[sessionKey] ?? sessionEntry;
           if (entry) {
             const input = usage.input ?? 0;
             const output = usage.output ?? 0;
@@ -872,19 +1148,21 @@ export async function getReplyFromConfig(
               contextTokens: contextTokens ?? entry.contextTokens,
               updatedAt: Date.now(),
             };
-            sessionStore[sessionKey] = sessionEntry;
-            await saveSessionStore(storePath, sessionStore);
+            usageStore[sessionKey] = sessionEntry;
+            await saveSessionStore(storePath, usageStore);
           }
         } else if (model || contextTokens) {
-          const entry = sessionEntry ?? sessionStore[sessionKey];
+          // Reload to avoid race condition with concurrent requests
+          const modelStore = loadSessionStore(storePath);
+          const entry = modelStore[sessionKey] ?? sessionEntry;
           if (entry) {
             sessionEntry = {
               ...entry,
               model: model ?? entry.model,
               contextTokens: contextTokens ?? entry.contextTokens,
             };
-            sessionStore[sessionKey] = sessionEntry;
-            await saveSessionStore(storePath, sessionStore);
+            modelStore[sessionKey] = sessionEntry;
+            await saveSessionStore(storePath, modelStore);
           }
         }
       }
@@ -902,7 +1180,7 @@ export async function getReplyFromConfig(
       if (sessionIdHint) {
         finalPayloads = [
           { text: `🧭 New session: ${sessionIdHint}` },
-          ...payloadArray,
+          ...allPayloads,
         ];
       }
       return finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads;

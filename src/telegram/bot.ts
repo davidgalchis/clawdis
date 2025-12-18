@@ -10,6 +10,11 @@ import { formatAgentEnvelope } from "../auto-reply/envelope.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
 import { loadConfig } from "../config/config.js";
+import {
+  addPending,
+  type PendingRequest,
+  removePendingByChat,
+} from "../config/pending.js";
 import { resolveStorePath, updateLastRoute } from "../config/sessions.js";
 import { danger, logVerbose } from "../globals.js";
 import { getChildLogger } from "../logging.js";
@@ -133,12 +138,19 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         body: rawBody,
       });
 
+      // Look up per-group configuration
+      const groupConfig = isGroup
+        ? cfg.telegram?.groups?.[String(chatId)]
+        : undefined;
+
       const ctxPayload = {
         Body: body,
         From: isGroup ? `group:${chatId}` : `telegram:${chatId}`,
         To: `telegram:${chatId}`,
         ChatType: isGroup ? "group" : "direct",
-        GroupSubject: isGroup ? (msg.chat.title ?? undefined) : undefined,
+        GroupSubject: isGroup
+          ? (groupConfig?.name ?? msg.chat.title ?? undefined)
+          : undefined,
         SenderName: buildSenderName(msg),
         Surface: "telegram",
         MessageSid: String(msg.message_id),
@@ -146,6 +158,9 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         MediaPath: media?.path,
         MediaType: media?.contentType,
         MediaUrl: media?.path,
+        // Per-group overrides
+        GroupCwd: groupConfig?.cwd,
+        DefaultPermissionMode: groupConfig?.permissionMode,
       };
 
       if (!isGroup) {
@@ -167,25 +182,132 @@ export function createTelegramBot(opts: TelegramBotOptions) {
         );
       }
 
-      const replyResult = await getReplyFromConfig(
-        ctxPayload,
-        { onReplyStart: sendTyping },
-        cfg,
-      );
-      const replies = replyResult
-        ? Array.isArray(replyResult)
-          ? replyResult
-          : [replyResult]
-        : [];
-      if (replies.length === 0) return;
+      // Fire off reply handling without blocking the message handler
+      // This allows concurrent message processing across groups
+      void (async () => {
+        // Track this as a pending request for recovery
+        const pendingReq: PendingRequest = {
+          chatId: String(chatId),
+          sessionId: "", // Will be updated via onSessionReady
+          surface: "telegram",
+          startedAt: Date.now(),
+          message: rawBody.slice(0, 200), // Store preview for debugging
+        };
+        let pendingKey: string | undefined;
 
-      await deliverReplies({
-        replies,
-        chatId: String(chatId),
-        token: opts.token,
-        runtime,
-        bot,
-      });
+        try {
+          // Track progress in a single editable message
+          let progressMsgId: number | undefined;
+          const toolHistory: string[] = [];
+          let lastEditTime = 0;
+          const EDIT_THROTTLE_MS = 1500; // Min time between edits
+          const HEARTBEAT_MS = 15000; // Heartbeat every 15 seconds
+          let heartbeatInterval: NodeJS.Timeout | undefined;
+          const startTime = Date.now();
+
+          const formatTimestamp = () => {
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            const mins = Math.floor(elapsed / 60);
+            const secs = elapsed % 60;
+            return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+          };
+
+          const updateProgressMessage = async () => {
+            const progressText = toolHistory.slice(-8).join("\n"); // Last 8 tools
+            const timestamp = formatTimestamp();
+            const header = `⏳ Working... (${timestamp})`;
+            const content = progressText
+              ? `${header}\n${progressText}`
+              : header;
+            try {
+              if (!progressMsgId) {
+                const sent = await bot.api.sendMessage(chatId, content);
+                progressMsgId = sent.message_id;
+              } else {
+                await bot.api.editMessageText(chatId, progressMsgId, content);
+              }
+              lastEditTime = Date.now();
+            } catch (err) {
+              logVerbose(`telegram progress update failed: ${String(err)}`);
+            }
+          };
+
+          const startHeartbeat = () => {
+            if (heartbeatInterval) return;
+            heartbeatInterval = setInterval(async () => {
+              if (progressMsgId) {
+                await updateProgressMessage();
+              }
+            }, HEARTBEAT_MS);
+          };
+
+          const stopHeartbeat = () => {
+            if (heartbeatInterval) {
+              clearInterval(heartbeatInterval);
+              heartbeatInterval = undefined;
+            }
+          };
+
+          const onPartialReply = async (payload: { text?: string }) => {
+            if (!payload.text) return;
+            toolHistory.push(payload.text);
+
+            const now = Date.now();
+            if (now - lastEditTime < EDIT_THROTTLE_MS && progressMsgId) {
+              return; // Throttle edits
+            }
+
+            await updateProgressMessage();
+            startHeartbeat(); // Start heartbeat after first tool activity
+          };
+
+          const onSessionReady = (info: {
+            sessionId: string;
+            cwd?: string;
+          }) => {
+            // Update pending with session info for recovery
+            pendingReq.sessionId = info.sessionId;
+            pendingReq.cwd = info.cwd;
+            pendingKey = addPending(pendingReq);
+            logVerbose(
+              `telegram pending added: ${pendingKey} session=${info.sessionId}`,
+            );
+          };
+
+          const replyResult = await getReplyFromConfig(
+            ctxPayload,
+            { onReplyStart: sendTyping, onPartialReply, onSessionReady },
+            cfg,
+          );
+
+          // Stop heartbeat but keep progress message visible for history
+          stopHeartbeat();
+          const replies = replyResult
+            ? Array.isArray(replyResult)
+              ? replyResult
+              : [replyResult]
+            : [];
+          if (replies.length === 0) return;
+
+          await deliverReplies({
+            replies,
+            chatId: String(chatId),
+            token: opts.token,
+            runtime,
+            bot,
+          });
+
+          // Remove from pending after successful delivery
+          if (pendingKey) {
+            removePendingByChat("telegram", String(chatId));
+            logVerbose(`telegram pending removed: ${pendingKey}`);
+          }
+        } catch (innerErr) {
+          stopHeartbeat();
+          runtime.error?.(danger(`Telegram reply failed: ${String(innerErr)}`));
+          // Keep pending on failure so recovery can retry
+        }
+      })();
     } catch (err) {
       runtime.error?.(danger(`Telegram handler failed: ${String(err)}`));
     }

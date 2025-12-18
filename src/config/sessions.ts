@@ -16,6 +16,7 @@ export type SessionEntry = {
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  permissionMode?: string;
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
