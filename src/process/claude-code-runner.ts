@@ -1,8 +1,27 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, execSync } from "node:child_process";
 import readline from "node:readline";
 
 // Registry of running processes by chat ID for cancellation
-const runningProcesses = new Map<string, ChildProcess>();
+type TrackedProcess = {
+  proc: ChildProcess;
+  cwd?: string;
+};
+const runningProcesses = new Map<string, TrackedProcess>();
+
+/**
+ * Kill all processes running in a specific working directory.
+ * This catches orphaned child processes (like npm scripts) that Claude spawned.
+ */
+function killProcessesByCwd(cwd: string): void {
+  if (!cwd) return;
+  try {
+    // Use pkill to kill processes whose command line contains the cwd
+    // This catches npm, node, etc. running in that directory
+    execSync(`pkill -9 -f "${cwd}"`, { stdio: "ignore" });
+  } catch {
+    // pkill returns non-zero if no processes matched, which is fine
+  }
+}
 
 export type ClaudeCodeRunOptions = {
   argv: string[];
@@ -19,13 +38,29 @@ export type ClaudeCodeRunOptions = {
  * Returns true if a process was found and killed.
  */
 export function cancelClaudeProcess(trackingId: string): boolean {
-  const proc = runningProcesses.get(trackingId);
-  if (proc && !proc.killed) {
-    proc.kill("SIGTERM");
+  const tracked = runningProcesses.get(trackingId);
+  if (tracked && !tracked.proc.killed && tracked.proc.pid) {
+    const { proc, cwd } = tracked;
+    const pid = tracked.proc.pid; // Capture for closure
+    // Kill entire process group (negative PID) to kill all children too
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      // Fallback to just killing the main process
+      proc.kill("SIGTERM");
+    }
     // Give it a moment, then force kill if needed
     setTimeout(() => {
       if (!proc.killed) {
-        proc.kill("SIGKILL");
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          proc.kill("SIGKILL");
+        }
+      }
+      // Also kill any orphaned processes in the working directory
+      if (cwd) {
+        killProcessesByCwd(cwd);
       }
     }, 2000);
     runningProcesses.delete(trackingId);
@@ -38,8 +73,8 @@ export function cancelClaudeProcess(trackingId: string): boolean {
  * Check if there's a running process for the given tracking ID.
  */
 export function hasRunningProcess(trackingId: string): boolean {
-  const proc = runningProcesses.get(trackingId);
-  return !!proc && !proc.killed;
+  const tracked = runningProcesses.get(trackingId);
+  return !!tracked && !tracked.proc.killed;
 }
 
 export type ClaudeCodeResult = {
@@ -70,11 +105,12 @@ export async function runClaudeCode(
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...env },
+      detached: true, // Create new process group so we can kill all children
     });
 
     // Register for cancellation if tracking ID provided
     if (trackingId) {
-      runningProcesses.set(trackingId, child);
+      runningProcesses.set(trackingId, { proc: child, cwd });
     }
 
     let stdout = "";
@@ -95,7 +131,16 @@ export async function runClaudeCode(
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      // Kill entire process group on timeout
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      } else {
+        child.kill("SIGKILL");
+      }
     }, timeoutMs);
 
     child.on("exit", (code, signal) => {

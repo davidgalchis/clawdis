@@ -90,6 +90,8 @@ export type CommandReplyMeta = {
   exitCode?: number | null;
   signal?: string | null;
   killed?: boolean;
+  /** Process was cancelled by user (stop command) */
+  cancelled?: boolean;
   agentMeta?: AgentMeta;
 };
 
@@ -524,7 +526,7 @@ export async function runCommandReply(
       return result;
     };
 
-    const { stdout, stderr, code, signal, killed, timedOut } = await enqueue(
+    const { stdout, stderr, code, signal, killed, timedOut, cancelled } = await enqueue(
       run,
       {
         onWait: (waitMs, ahead) => {
@@ -544,6 +546,7 @@ export async function runCommandReply(
     const signalUsed = signal;
     const killedUsed = killed;
     const timedOutUsed = timedOut;
+    const cancelledUsed = cancelled;
     const rawStdout = stdoutUsed.trim();
     let mediaFromCommand: string[] | undefined;
     // For Claude Code, pass the raw output to parseOutput (it handles JSON parsing)
@@ -688,10 +691,7 @@ export async function runCommandReply(
       replyItems.length > 0 &&
       (/[:]\s*$/.test(trimmedLast) ||
         /[?]\s*$/.test(trimmedLast) ||
-        /\b(next step|here'?s what|i('ll| will) (now|next)|let me|going to)\b/i.test(trimmedLast) ||
-        /\b(now|next|try|check|run|test|let me|going to)\s*[:.!]?\s*$/i.test(
-          trimmedLast,
-        ));
+        /\b(next steps?|here'?s what|i('ll| will|to) (now|next|continue|run|try|check|test|do)|let me|going to|continue|now|next|try|check|run|test)\b/i.test(trimmedLast));
     // Also mark as incomplete if process was killed (timeout) or produced no output while tools ran
     const processWasKilled = killedUsed === true || timedOutUsed === true;
     const noOutputButToolsRan =
@@ -742,6 +742,7 @@ export async function runCommandReply(
           exitCode: codeUsed,
           signal: signalUsed,
           killed: killedUsed,
+          cancelled: cancelledUsed,
           agentMeta: parsed?.meta,
         },
       };
@@ -760,6 +761,7 @@ export async function runCommandReply(
           exitCode: codeUsed,
           signal: signalUsed,
           killed: killedUsed,
+          cancelled: cancelledUsed,
           agentMeta: parsed?.meta,
         },
       };
@@ -772,6 +774,7 @@ export async function runCommandReply(
       exitCode: codeUsed,
       signal: signalUsed,
       killed: killedUsed,
+      cancelled: cancelledUsed,
       agentMeta: parsed?.meta,
     };
 

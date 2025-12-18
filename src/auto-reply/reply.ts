@@ -1044,6 +1044,12 @@ export async function getReplyFromConfig(
           };
         }
 
+        // If cancelled by user, stop immediately
+        if (lastMeta?.cancelled) {
+          logVerbose("Auto-continue stopped: process was cancelled by user");
+          break;
+        }
+
         // Check if we should auto-continue
         if (
           autoContinue &&

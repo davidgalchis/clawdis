@@ -3198,6 +3198,13 @@ export async function startGatewayServer(
                 ],
                 cwd: req.cwd,
                 timeoutMs: 24 * 60 * 60 * 1000, // 24 hour timeout
+                // Construct tracking ID to match ctx.From format used in reply.ts
+                trackingId:
+                  req.surface === "telegram"
+                    ? req.chatId.startsWith("-")
+                      ? `group:${req.chatId}` // Telegram group
+                      : `telegram:${req.chatId}` // Telegram DM
+                    : `whatsapp:${req.chatId}`, // WhatsApp
                 onLine: async (line: string) => {
                   try {
                     const ev = JSON.parse(line) as {
@@ -3286,11 +3293,16 @@ export async function startGatewayServer(
                 responseText.length > 0 &&
                 (/[:]\s*$/.test(trimmedLast) ||
                   /[?]\s*$/.test(trimmedLast) ||
-                  /\b(next step|here'?s what|i('ll| will) (now|next)|let me|going to)\b/i.test(trimmedLast) ||
-                  /\b(now|next|try|check|run|test|let me|going to)\s*[:.!]?\s*$/i.test(trimmedLast));
+                  /\b(next steps?|here'?s what|i('ll| will|to) (now|next|continue|run|try|check|test|do)|let me|going to|continue|now|next|try|check|run|test)\b/i.test(trimmedLast));
               const processWasKilled = resumeResult.killed || resumeResult.timedOut;
               const noOutputButToolsRan = responseText.length === 0 && toolHistory.length > 0;
               const outputLooksIncomplete = textLooksIncomplete || processWasKilled || noOutputButToolsRan;
+
+              // If cancelled by user, stop immediately
+              if (resumeResult.cancelled) {
+                defaultRuntime.log("gateway: recovery cancelled by user");
+                break;
+              }
 
               // Check if we should auto-continue
               if (
